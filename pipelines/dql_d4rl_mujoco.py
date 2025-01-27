@@ -7,6 +7,7 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.autograd as autograd
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
@@ -16,7 +17,30 @@ from cleandiffuser.diffusion import DiscreteDiffusionSDE
 from cleandiffuser.nn_condition import IdentityCondition
 from cleandiffuser.nn_diffusion import DQLMlp
 from cleandiffuser.utils import report_parameters, DQLCritic, FreezeModules
+from cleandiffuser.STAC.actors.kernels import RBF
 from utils import set_seed
+import warnings
+
+warnings.filterwarnings("ignore")
+
+def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kernel):
+    a = a_0 # always initiate the particles with the behavioral actions
+    KL = torch.zeros(256, 1) # this should be a tensor
+    for l in range(itr_num):
+        q_1, q_2 = critic(s,a)
+        # print(q_1.size(), q_2.size(),s.size(),a.size()) # [256,1],[256,1],[256,17],[256,6]
+        score_func = autograd.grad(q_1.sum()+q_2.sum(), a, retain_graph=True, create_graph=True)[0]
+        a = a.reshape(-1, num_particles, act_dim)
+        # print(a.size()) # [16,16,6]
+        score_func = score_func.reshape(a.size())
+        K_value, K_diff, K_gamma, K_grad = kernel(a, a)
+        h = (K_value.matmul(score_func) + K_grad.sum(1)) / num_particles
+        # print(h.size()) #[16,16,6]
+        a = a.reshape(-1,act_dim)
+        KL = KL - svgd_step * torch.trace(autograd.grad(h.sum(), a, retain_graph=True, create_graph=True)[0])
+        print(KL.size())
+        a = a + svgd_step * h # update the particles
+    return a, KL # should be of size [256,6] and [256,1]
 
 
 @hydra.main(config_path="../configs/dql/mujoco", config_name="mujoco", version_base=None)
@@ -65,26 +89,36 @@ def pipeline(args):
         critic.train()
 
         n_gradient_step = 0
-        log = {"bc_loss": 0., "q_loss": 0., "critic_loss": 0., "target_q_mean": 0.}
+        log = {"critic_loss": 0., "target_q_mean": 0., "KL_divergence": 0.}
 
         prior = torch.zeros((args.batch_size, act_dim), device=args.device)
 
-        for batch in loop_dataloader(dataloader):
+        for batch in loop_dataloader(dataloader): # will end after sufficient gradient steps
 
             obs, next_obs = batch["obs"]["state"].to(args.device), batch["next_obs"]["state"].to(args.device)
             act = batch["act"].to(args.device)
             rew = batch["rew"].to(args.device)
             tml = batch["tml"].to(args.device)
 
+            # generate behavioral actions
+            a_0, log = actor.sample(
+                prior, solver=args.solver,
+                n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=False,
+                temperature=1.0, condition_cfg=obs, w_cfg=1.0, requires_grad=True)
+            # p_a_0 = log['log_p']
+
             # Critic Training
             current_q1, current_q2 = critic(obs, act)
+            kernel = RBF(num_particles=args.num_particles, sigma=None, adaptive_sig=4, device=args.device)
 
-            next_act, _ = actor.sample(
-                prior, solver=args.solver,
-                n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=True,
-                temperature=1.0, condition_cfg=next_obs, w_cfg=1.0, requires_grad=False)
+            next_act, KL = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic, kernel)
 
-            target_q = torch.min(*critic_target(next_obs, next_act))
+            # next_act, _ = actor.sample(
+            #     prior, solver=args.solver,
+            #     n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=True,
+            #     temperature=1.0, condition_cfg=next_obs, w_cfg=1.0, requires_grad=False)
+
+            target_q = torch.min(*critic_target(next_obs, next_act)) - args.alpha * KL 
             target_q = (rew + (1 - tml) * args.discount * target_q).detach()
 
             critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
@@ -93,24 +127,27 @@ def pipeline(args):
             critic_loss.backward()
             critic_optim.step()
 
-            # -- Policy Training
-            bc_loss = actor.loss(act, obs)
-            new_act, _ = actor.sample(
-                prior, solver=args.solver,
-                n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=False,
-                temperature=1.0, condition_cfg=obs, w_cfg=1.0, requires_grad=True)
+            # Policy Training
+            # bc_loss = actor.loss(act, obs)
+            # new_act, _ = actor.sample(
+            #     prior, solver=args.solver,
+            #     n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=False,
+            #     temperature=1.0, condition_cfg=obs, w_cfg=1.0, requires_grad=True)
 
-            with FreezeModules([critic, ]):
-                q1_new_action, q2_new_action = critic(obs, new_act)
-            if np.random.uniform() > 0.5:
-                q_loss = - q1_new_action.mean() / q2_new_action.abs().mean().detach()
-            else:
-                q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
-            actor_loss = bc_loss + args.task.eta * q_loss
+            # with FreezeModules([critic, ]):
+            #     q1_new_action, q2_new_action = critic(obs, new_act)
+            # if np.random.uniform() > 0.5:
+            #     q_loss = - q1_new_action.mean() / q2_new_action.abs().mean().detach()
+            # else:
+            #     q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
+            # actor_loss = bc_loss + args.task.eta * q_loss
 
-            actor.optimizer.zero_grad()
-            actor_loss.backward()
-            actor.optimizer.step()
+            # actor.optimizer.zero_grad()
+            # actor_loss.backward()
+            # actor.optimizer.step()
+
+            # Policy Training
+            a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic)
 
             actor_lr_scheduler.step()
             critic_lr_scheduler.step()
@@ -123,24 +160,25 @@ def pipeline(args):
                     target_param.data.copy_(0.995 * param.data + (1 - 0.995) * target_param.data)
 
             # # ----------- Logging ------------
-            log["bc_loss"] += bc_loss.item()
-            log["q_loss"] += q_loss.item()
+            # log["bc_loss"] += bc_loss.item()
+            # log["q_loss"] += q_loss.item()
             log["critic_loss"] += critic_loss.item()
             log["target_q_mean"] += target_q.mean().item()
+            log["KL_divergence"] += KL.item()
 
             if (n_gradient_step + 1) % args.log_interval == 0:
                 log["gradient_steps"] = n_gradient_step + 1
-                log["bc_loss"] /= args.log_interval
-                log["q_loss"] /= args.log_interval
+                # log["bc_loss"] /= args.log_interval
+                # log["q_loss"] /= args.log_interval
                 log["critic_loss"] /= args.log_interval
                 log["target_q_mean"] /= args.log_interval
                 print(log)
-                log = {"bc_loss": 0., "q_loss": 0., "critic_loss": 0., "target_q_mean": 0.}
+                log = {"critic_loss": 0., "target_q_mean": 0., "KL_divergence": 0.}
 
             # ----------- Saving ------------
             if (n_gradient_step + 1) % args.save_interval == 0:
-                actor.save(save_path + f"diffusion_ckpt_{n_gradient_step + 1}.pt")
-                actor.save(save_path + f"diffusion_ckpt_latest.pt")
+                # actor.save(save_path + f"diffusion_ckpt_{n_gradient_step + 1}.pt")
+                # actor.save(save_path + f"diffusion_ckpt_latest.pt")
                 torch.save({
                     "critic": critic.state_dict(),
                     "critic_target": critic_target.state_dict(),
@@ -157,12 +195,12 @@ def pipeline(args):
     # ---------------------- Inference ----------------------
     elif args.mode == "inference":
 
-        actor.load(save_path + f"diffusion_ckpt_{args.ckpt}.pt")
+        # actor.load(save_path + f"diffusion_ckpt_{args.ckpt}.pt")
         critic_ckpt = torch.load(save_path + f"critic_ckpt_{args.ckpt}.pt")
         critic.load_state_dict(critic_ckpt["critic"])
         critic_target.load_state_dict(critic_ckpt["critic_target"])
 
-        actor.eval()
+        # actor.eval()
         critic.eval()
         critic_target.eval()
 
@@ -181,20 +219,21 @@ def pipeline(args):
                 obs = obs.unsqueeze(1).repeat(1, args.num_candidates, 1).view(-1, obs_dim)
 
                 # sample actions
-                act, log = actor.sample(
-                    prior,
-                    solver=args.solver,
-                    n_samples=args.num_envs * args.num_candidates,
-                    sample_steps=args.sampling_steps,
-                    condition_cfg=obs, w_cfg=1.0,
-                    use_ema=args.use_ema, temperature=args.temperature)
+                # act, log = actor.sample(
+                #     prior,
+                #     solver=args.solver,
+                #     n_samples=args.num_envs * args.num_candidates,
+                #     sample_steps=args.sampling_steps,
+                #     condition_cfg=obs, w_cfg=1.0,
+                #     use_ema=args.use_ema, temperature=args.temperature)
+                a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic)
 
                 # resample
                 with torch.no_grad():
                     q = critic_target.q_min(obs, act)
                     q = q.view(-1, args.num_candidates, 1)
                     w = torch.softmax(q * args.task.weight_temperature, 1)
-                    act = act.view(-1, args.num_candidates, act_dim)
+                    act = a_L.view(-1, args.num_candidates, act_dim)
 
                     indices = torch.multinomial(w.squeeze(-1), 1).squeeze(-1)
                     sampled_act = act[torch.arange(act.shape[0]), indices].cpu().numpy()
