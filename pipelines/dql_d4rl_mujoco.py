@@ -23,9 +23,10 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kernel):
+def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kernel, device):
     a = a_0 # always initiate the particles with the behavioral actions
-    KL = torch.zeros(256, 1) # this should be a tensor
+    KL = torch.zeros(16,16).to(device) # this should be a tensor
+    identity = torch.eye(num_particles).to(device)
     for l in range(itr_num):
         q_1, q_2 = critic(s,a)
         # print(q_1.size(), q_2.size(),s.size(),a.size()) # [256,1],[256,1],[256,17],[256,6]
@@ -36,10 +37,15 @@ def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kern
         K_value, K_diff, K_gamma, K_grad = kernel(a, a)
         h = (K_value.matmul(score_func) + K_grad.sum(1)) / num_particles
         # print(h.size()) #[16,16,6]
-        a = a.reshape(-1,act_dim)
-        KL = KL - svgd_step * torch.trace(autograd.grad(h.sum(), a, retain_graph=True, create_graph=True)[0])
-        print(KL.size())
+        a, h = a.reshape(-1,act_dim), h.reshape(-1,act_dim)
+        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(2)/(num_particles-1)
+        term2 = -2 * K_gamma.squeeze(-1).squeeze(-1) * ((K_grad.permute(0,2,1,3) * K_diff).sum(-1) - act_dim * (K_value - identity)).sum(1) / (num_particles-1)
+        term3 = - (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(axis=-1).view(-1, num_particles)
+        term1, term2, term3 = term1.to(device), term2.to(device), term3.to(device)
+        # print(term1.size(),term2.size()) # [16,16],[16,16]
+        KL = KL + svgd_step * (term1 + term2)
         a = a + svgd_step * h # update the particles
+    KL = KL.reshape(256,1)
     return a, KL # should be of size [256,6] and [256,1]
 
 
@@ -101,7 +107,7 @@ def pipeline(args):
             tml = batch["tml"].to(args.device)
 
             # generate behavioral actions
-            a_0, log = actor.sample(
+            a_0, _ = actor.sample(
                 prior, solver=args.solver,
                 n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=False,
                 temperature=1.0, condition_cfg=obs, w_cfg=1.0, requires_grad=True)
@@ -111,7 +117,7 @@ def pipeline(args):
             current_q1, current_q2 = critic(obs, act)
             kernel = RBF(num_particles=args.num_particles, sigma=None, adaptive_sig=4, device=args.device)
 
-            next_act, KL = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic, kernel)
+            next_act, KL = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic, kernel, args.device)
 
             # next_act, _ = actor.sample(
             #     prior, solver=args.solver,
@@ -128,26 +134,7 @@ def pipeline(args):
             critic_optim.step()
 
             # Policy Training
-            # bc_loss = actor.loss(act, obs)
-            # new_act, _ = actor.sample(
-            #     prior, solver=args.solver,
-            #     n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=False,
-            #     temperature=1.0, condition_cfg=obs, w_cfg=1.0, requires_grad=True)
-
-            # with FreezeModules([critic, ]):
-            #     q1_new_action, q2_new_action = critic(obs, new_act)
-            # if np.random.uniform() > 0.5:
-            #     q_loss = - q1_new_action.mean() / q2_new_action.abs().mean().detach()
-            # else:
-            #     q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
-            # actor_loss = bc_loss + args.task.eta * q_loss
-
-            # actor.optimizer.zero_grad()
-            # actor_loss.backward()
-            # actor.optimizer.step()
-
-            # Policy Training
-            a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic)
+            a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic, kernel, args.device)
 
             actor_lr_scheduler.step()
             critic_lr_scheduler.step()
@@ -160,16 +147,12 @@ def pipeline(args):
                     target_param.data.copy_(0.995 * param.data + (1 - 0.995) * target_param.data)
 
             # # ----------- Logging ------------
-            # log["bc_loss"] += bc_loss.item()
-            # log["q_loss"] += q_loss.item()
             log["critic_loss"] += critic_loss.item()
             log["target_q_mean"] += target_q.mean().item()
-            log["KL_divergence"] += KL.item()
+            log["KL_divergence"] += KL.mean().item()
 
             if (n_gradient_step + 1) % args.log_interval == 0:
                 log["gradient_steps"] = n_gradient_step + 1
-                # log["bc_loss"] /= args.log_interval
-                # log["q_loss"] /= args.log_interval
                 log["critic_loss"] /= args.log_interval
                 log["target_q_mean"] /= args.log_interval
                 print(log)
@@ -218,15 +201,8 @@ def pipeline(args):
                 obs = torch.tensor(normalizer.normalize(obs), device=args.device, dtype=torch.float32)
                 obs = obs.unsqueeze(1).repeat(1, args.num_candidates, 1).view(-1, obs_dim)
 
-                # sample actions
-                # act, log = actor.sample(
-                #     prior,
-                #     solver=args.solver,
-                #     n_samples=args.num_envs * args.num_candidates,
-                #     sample_steps=args.sampling_steps,
-                #     condition_cfg=obs, w_cfg=1.0,
-                #     use_ema=args.use_ema, temperature=args.temperature)
-                a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic)
+                kernel = RBF(num_particles=args.num_particles, sigma=None, adaptive_sig=4, device=args.device)
+                a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.num_particles, act_dim, critic, kernel, args.device)
 
                 # resample
                 with torch.no_grad():
