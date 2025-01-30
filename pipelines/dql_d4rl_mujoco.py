@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore")
 
 def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kernel, device):
     a = a_0 # always initiate the particles with the behavioral actions
-    KL = torch.zeros(16,16).to(device) # this should be a tensor
+    KL = torch.zeros(16,16).to(device) 
     identity = torch.eye(num_particles).to(device)
     for l in range(itr_num):
         q_1, q_2 = critic(s,a)
@@ -38,6 +38,7 @@ def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kern
         h = (K_value.matmul(score_func) + K_grad.sum(1)) / num_particles
         # print(h.size()) #[16,16,6]
         a, h = a.reshape(-1,act_dim), h.reshape(-1,act_dim)
+        # compute the KL divergence
         term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(2)/(num_particles-1)
         term2 = -2 * K_gamma.squeeze(-1).squeeze(-1) * ((K_grad.permute(0,2,1,3) * K_diff).sum(-1) - act_dim * (K_value - identity)).sum(1) / (num_particles-1)
         term3 = - (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(axis=-1).view(-1, num_particles)
@@ -155,6 +156,7 @@ def pipeline(args):
                 log["gradient_steps"] = n_gradient_step + 1
                 log["critic_loss"] /= args.log_interval
                 log["target_q_mean"] /= args.log_interval
+                log["KL_divergence"] /= args.log_interval
                 print(log)
                 log = {"critic_loss": 0., "target_q_mean": 0., "KL_divergence": 0.}
 
