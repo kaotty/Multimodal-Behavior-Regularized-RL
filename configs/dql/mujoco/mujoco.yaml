@@ -3,7 +3,7 @@ defaults:
   - task: halfcheetah-medium-expert-v2
 
 pipeline_name: dql_d4rl_mujoco
-mode: train
+mode: inference
 seed: 0
 device: cuda:0
 
@@ -18,8 +18,9 @@ sampling_steps: 5
 predict_noise: True
 ema_rate: 0.995
 actor_learning_rate: 0.0003
-num_particles: 16
-itr_num: 5
+training_num_particles: 16
+inference_num_particles: 50
+itr_num: 10
 svgd_step: 0.1
 
 # Critic
@@ -29,11 +30,12 @@ alpha: 0.2
 
 
 # Training
-gradient_steps: 1000000
+gradient_steps: 500000
 batch_size: 256
 ema_update_interval: 5
 log_interval: 1000
 save_interval: 100000
+inference_interval: 5000
 
 # Inference
 ckpt: latest
