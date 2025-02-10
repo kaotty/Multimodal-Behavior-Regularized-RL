@@ -105,7 +105,7 @@ def pipeline(args):
     critic.train()
 
     n_gradient_step = 0
-    log = {"critic_loss": 0., "target_q_mean": 0., "KL_divergence": 0.}
+    log = {"critic_loss": 0., "actor_loss":0., "target_q_mean": 0., "KL_divergence": 0.}
 
 
     for batch in loop_dataloader(dataloader): # will end after sufficient gradient steps
@@ -140,6 +140,10 @@ def pipeline(args):
 
         # Policy Training
         a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.training_num_particles, act_dim, critic, kernel, args.device)
+        actor_loss = actor.loss(act, obs)
+        actor.optimizer.zero_grad()
+        actor_loss.backward()
+        actor.optimizer.step()
 
         actor_lr_scheduler.step()
         critic_lr_scheduler.step()
@@ -153,17 +157,18 @@ def pipeline(args):
 
         # ----------- Logging ------------
         log["critic_loss"] += critic_loss.item()
+        log["actor_loss"] += actor_loss.item()
         log["target_q_mean"] += target_q.mean().item()
         log["KL_divergence"] += KL.mean().item()
 
         if (n_gradient_step + 1) % args.log_interval == 0:
             log["gradient_steps"] = n_gradient_step + 1
             log["critic_loss"] /= args.log_interval
+            log["actor_loss"] /= args.log_interval
             log["target_q_mean"] /= args.log_interval
             log["KL_divergence"] /= args.log_interval
-            logger.info("Training gradient step:{}, Critic loss:{}, Target q mean:{}, KL divergence:{}".format(log["gradient_steps"],log["critic_loss"],log["target_q_mean"],log["KL_divergence"]))
-            print(log)
-            log = {"critic_loss": 0., "target_q_mean": 0., "KL_divergence": 0.}
+            logger.info("Training gradient step:{}, Critic loss:{}, Actor loss:{}, Target q mean:{}, KL divergence:{}".format(log["gradient_steps"],log["critic_loss"],log["actor_loss"],log["target_q_mean"],log["KL_divergence"]))
+            log = {"critic_loss": 0., "actor_loss":0., "target_q_mean": 0., "KL_divergence": 0.}
 
         # ----------- Inference ------------
         if (n_gradient_step + 1) % args.inference_interval == 0:
@@ -171,7 +176,7 @@ def pipeline(args):
             # critic_inference.load_state_dict(critic_ckpt["critic"])
             # critic_target.load_state_dict(critic_ckpt["critic_target"])
 
-            # # actor.eval()
+            actor.eval()
             critic.eval()
             critic_target.eval()
 
@@ -225,6 +230,7 @@ def pipeline(args):
             print(np.mean(episode_rewards, -1), np.std(episode_rewards, -1))
 
             critic.train()
+            actor.train()
 
         # ----------- Saving ------------
         if (n_gradient_step + 1) % args.save_interval == 0:
