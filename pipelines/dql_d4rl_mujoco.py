@@ -29,21 +29,23 @@ def svgd_update(a_0, s, itr_num, svgd_step, num_particles, act_dim, critic, kern
     identity = torch.eye(num_particles).to(device)
     for l in range(itr_num):
         q_1, q_2 = critic(s,a)
+        q = torch.min(q_1,q_2)
         # print(q_1.size(), q_2.size(),s.size(),a.size()) # [256,1],[256,1],[256,17],[256,6]
-        score_func = autograd.grad(q_1.sum()+q_2.sum(), a, retain_graph=True, create_graph=True)[0]
+        score_func = autograd.grad(q.sum(), a, retain_graph=True, create_graph=True)[0]
         a = a.reshape(-1, num_particles, act_dim)
         # print(a.size()) # [16,16,6]
         score_func = score_func.reshape(a.size())
-        K_value, K_diff, K_gamma, K_grad = kernel(a, a)
+        K_value, K_dist_sq, K_gamma, K_grad = kernel(a, a) # [16,16,16],[16,16,16],[16,1,1],[16,16,16,6]
+        # print(K_value.size(),K_dist_sq.size(),K_gamma.size(),K_grad.size())
         h = (K_value.matmul(score_func) + K_grad.sum(1)) / num_particles
-        # print(h.size()) #[16,16,6]
+        # print(h.size()) #[16,16,6]  
         a, h = a.reshape(-1,act_dim), h.reshape(-1,act_dim)
         # compute the KL divergence
-        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(2)/(num_particles-1)
-        term2 = -2 * K_gamma.squeeze(-1).squeeze(-1) * ((K_grad.permute(0,2,1,3) * K_diff).sum(-1) - act_dim * (K_value - identity)).sum(1) / (num_particles-1)
-        term3 = - (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(axis=-1).view(-1, num_particles)
-        term1, term2, term3 = term1.to(device), term2.to(device), term3.to(device)
-        # print(term1.size(),term2.size()) # [16,16],[16,16]
+        score_func = score_func.reshape(num_particles, act_dim, num_particles).unsqueeze(1) # [16,1,6,16]
+        term1 = (K_grad.matmul(score_func)).sum(-1).sum(-1)/(num_particles-1) # [16,16]
+        term2 = K_value.matmul(act_dim * K_gamma - K_dist_sq * K_gamma.pow(2)).sum(-1) / (num_particles-1) # [16,16]
+        term1, term2 = term1.to(device), term2.to(device)
+        # print(term1.size(),term2.size())
         KL = KL + svgd_step * (term1 + term2)
         a = a + svgd_step * h # update the particles
     KL = KL.reshape(num_particles*num_particles,1)
@@ -74,7 +76,7 @@ def pipeline(args):
     logger.setLevel(logging.INFO)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(os.path.join(script_dir,'logs'), exist_ok=True)
-    log_path = os.path.join(script_dir, 'logs', 'initial_test')
+    log_path = os.path.join(script_dir, 'logs', 'itr{}-alpha{}'.format(args.itr_num,args.alpha))
     file_handler = logging.FileHandler(log_path)
     file_handler.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -120,7 +122,7 @@ def pipeline(args):
         a_0, _ = actor.sample(
                 prior, solver=args.solver,
                 n_samples=args.batch_size, sample_steps=args.sampling_steps, use_ema=False,
-                temperature=1.0, condition_cfg=obs, w_cfg=1.0, requires_grad=True)
+                temperature=1.0, condition_cfg=next_obs, w_cfg=1.0, requires_grad=True)
         # p_a_0 = log['log_p']
 
         # Critic Training
@@ -139,8 +141,15 @@ def pipeline(args):
         critic_optim.step()
 
         # Policy Training
-        a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.training_num_particles, act_dim, critic, kernel, args.device)
-        actor_loss = actor.loss(act, obs)
+        # a_L, KL = svgd_update(a_0, obs, args.itr_num, args.svgd_step, args.training_num_particles, act_dim, critic, kernel, args.device)
+        # with FreezeModules([critic, ]):
+        #     q1_new_action, q2_new_action = critic(obs, a_L)
+        # if np.random.uniform() > 0.5:
+        #     q_loss = - q1_new_action.mean() / q2_new_action.abs().mean().detach()
+        # else:
+        #     q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
+        
+        actor_loss = actor.loss(act, obs) #+ args.task.eta * q_loss
         actor.optimizer.zero_grad()
         actor_loss.backward()
         actor.optimizer.step()
@@ -167,7 +176,7 @@ def pipeline(args):
             log["actor_loss"] /= args.log_interval
             log["target_q_mean"] /= args.log_interval
             log["KL_divergence"] /= args.log_interval
-            logger.info("Training gradient step:{}, Critic loss:{}, Actor loss:{}, Target q mean:{}, KL divergence:{}".format(log["gradient_steps"],log["critic_loss"],log["actor_loss"],log["target_q_mean"],log["KL_divergence"]))
+            logger.info("Training gradient step:{}, Critic loss:{}, Target q mean:{}, KL divergence:{}".format(log["gradient_steps"],log["critic_loss"],log["target_q_mean"],log["KL_divergence"]))
             log = {"critic_loss": 0., "actor_loss":0., "target_q_mean": 0., "KL_divergence": 0.}
 
         # ----------- Inference ------------
@@ -225,9 +234,9 @@ def pipeline(args):
                 episode_rewards.append(ep_reward)
 
             episode_rewards = [list(map(lambda x: env.get_normalized_score(x), r)) for r in episode_rewards]
+            # episode_rewards = [list(map(lambda x: x, r)) for r in episode_rewards]
             episode_rewards = np.array(episode_rewards)
             logger.info("Inference gradient step:{}, mean:{}, std:{}".format(n_gradient_step + 1, np.mean(episode_rewards, -1), np.std(episode_rewards, -1)))
-            print(np.mean(episode_rewards, -1), np.std(episode_rewards, -1))
 
             critic.train()
             actor.train()
