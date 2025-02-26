@@ -76,7 +76,7 @@ def pipeline(args):
     logger.setLevel(logging.INFO)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.makedirs(os.path.join(script_dir,'logs'), exist_ok=True)
-    log_path = os.path.join(script_dir, 'logs', 'itr{}-alpha{}'.format(args.itr_num,args.alpha))
+    log_path = os.path.join(script_dir, 'logs', 'noupdate_itr{}-alpha{}'.format(args.itr_num,args.alpha))
     file_handler = logging.FileHandler(log_path)
     file_handler.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -132,6 +132,7 @@ def pipeline(args):
         next_act, KL = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.training_num_particles, act_dim, critic, kernel, args.device)
 
         target_q = torch.min(*critic_target(next_obs, next_act)) - args.alpha * KL 
+        # print("q:{},KL:{}".format(torch.min(*critic_target(next_obs, next_act)).mean(), KL.mean()))
         target_q = (rew + (1 - tml) * args.discount * target_q).detach()
 
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
@@ -149,12 +150,12 @@ def pipeline(args):
         # else:
         #     q_loss = - q2_new_action.mean() / q1_new_action.abs().mean().detach()
         
-        actor_loss = actor.loss(act, obs) #+ args.task.eta * q_loss
-        actor.optimizer.zero_grad()
-        actor_loss.backward()
-        actor.optimizer.step()
+        # actor_loss = actor.loss(act, obs) #+ args.task.eta * q_loss
+        # actor.optimizer.zero_grad()
+        # actor_loss.backward()
+        # actor.optimizer.step()
 
-        actor_lr_scheduler.step()
+        # actor_lr_scheduler.step()
         critic_lr_scheduler.step()
 
         # -- ema
@@ -166,14 +167,14 @@ def pipeline(args):
 
         # ----------- Logging ------------
         log["critic_loss"] += critic_loss.item()
-        log["actor_loss"] += actor_loss.item()
+        # log["actor_loss"] += actor_loss.item()
         log["target_q_mean"] += target_q.mean().item()
         log["KL_divergence"] += KL.mean().item()
 
         if (n_gradient_step + 1) % args.log_interval == 0:
             log["gradient_steps"] = n_gradient_step + 1
             log["critic_loss"] /= args.log_interval
-            log["actor_loss"] /= args.log_interval
+            # log["actor_loss"] /= args.log_interval
             log["target_q_mean"] /= args.log_interval
             log["KL_divergence"] /= args.log_interval
             logger.info("Training gradient step:{}, Critic loss:{}, Target q mean:{}, KL divergence:{}".format(log["gradient_steps"],log["critic_loss"],log["target_q_mean"],log["KL_divergence"]))
