@@ -131,7 +131,7 @@ def pipeline(args):
 
         next_act, KL = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.training_num_particles, act_dim, critic, kernel, args.device)
 
-        target_q = torch.min(*critic_target(next_obs, next_act)) - args.alpha * KL 
+        target_q = torch.min(*critic_target(next_obs, next_act)) + args.alpha * KL 
         # print("q:{},KL:{}".format(torch.min(*critic_target(next_obs, next_act)).mean(), KL.mean()))
         target_q = (rew + (1 - tml) * args.discount * target_q).detach()
 
