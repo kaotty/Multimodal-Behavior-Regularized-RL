@@ -67,21 +67,23 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
         q_1, q_2 = critic(s, a)
         q = torch.min(q_1, q_2)
         score_func = autograd.grad(q.sum(), a, retain_graph=True, create_graph=True)[0].to(device) # [batch_size * num_particles, act_dim]
-        a, score_func = a.view(batch_size, num_particles, act_dim), score_func.view(batch_size, num_particles, act_dim)
+        a, score_func = a.reshape(batch_size, num_particles, act_dim), score_func.reshape(batch_size, num_particles, act_dim)
         # print(a.size(), score_func.size()) # [100,10,3],[100,10,3]
         K_value, K_dist_sq, K_gamma, K_grad = kernel(a, a)
+        # print("gamma:{}, dist:{}".format(K_gamma.mean(), K_dist_sq.mean()))
         # print(K_value.size(),K_dist_sq.size(),K_gamma.size(),K_grad.size()) # [100,10,10],[100,10,10],[100,1,1],[100,10,10,3]
-        h = (K_value.matmul(score_func) - K_grad.sum(2)) / num_particles
-        a, h = a.view(-1, act_dim), h.view(-1, act_dim) # [batch_size * num_particles, act_dim], [batch_size * num_particles, act_dim]
+        h = (K_value.matmul(score_func) - alpha * K_grad.sum(2)) / num_particles
+        a, h = a.reshape(-1, act_dim), h.reshape(-1, act_dim) # [batch_size * num_particles, act_dim], [batch_size * num_particles, act_dim]
 
         # compute the sum of traces
-        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1) / alpha
-        term2 = (K_value * (act_dim * K_gamma - K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
+        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1)
+        term2 = alpha * (K_value * (act_dim * K_gamma - K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
         # term3 = (K_grad.permute(0,1,3,2).matmul(score_func.unsqueeze(1))).sum(-1).sum(-1)/(num_particles-1)
         term1, term2 = term1.to(device), term2.to(device)
+        # print(term2)
         # print(term1.size(),term2.size()) # [100,10],[100,10]
         tr = tr + svgd_step * (term1 + term2)
-        tr = tr.view(batch_size * num_particles, 1)
+        tr = tr.reshape(batch_size * num_particles, 1)
         a = a + svgd_step * h
 
     score = score_func.sum(-1)
@@ -181,7 +183,7 @@ def pipeline(args):
         rew = batch["rew"].to(args.device)
         tml = batch["tml"].to(args.device)
         prior = torch.zeros((args.batch_size * args.training_num_particles, act_dim), device=args.device)
-        kernel = RBF(num_particles=args.training_num_particles, sigma=None, adaptive_sig=4, device=args.device)
+        kernel = RBF(num_particles=args.training_num_particles, sigma=None, adaptive_sig=0, device=args.device)
 
         # generate behavioral actions
         next_obs = next_obs.unsqueeze(1).repeat(1, args.training_num_particles, 1).view(-1, obs_dim)
@@ -260,7 +262,7 @@ def pipeline(args):
                         n_samples=args.num_envs * args.num_candidates, sample_steps=args.sampling_steps, use_ema=False,
                         temperature=args.temperature, condition_cfg=obs, w_cfg=1.0, requires_grad=True)[0]
 
-                    kernel = RBF(num_particles=args.num_candidates, sigma=None, adaptive_sig=4, device=args.device)
+                    kernel = RBF(num_particles=args.num_candidates, sigma=None, adaptive_sig=0, device=args.device)
                     new_act, tr, score = svgd_update(act, obs, args.itr_num, args.svgd_step, args.num_envs, args.num_candidates, act_dim, args.alpha, critic, kernel, args.device)
 
                     # resample
