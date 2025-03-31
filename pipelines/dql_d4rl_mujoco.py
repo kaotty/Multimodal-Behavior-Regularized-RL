@@ -75,8 +75,8 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
         a, h = a.view(-1, act_dim), h.view(-1, act_dim) # [batch_size * num_particles, act_dim], [batch_size * num_particles, act_dim]
 
         # compute the sum of traces
-        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1)
-        term2 = alpha * (K_value * (act_dim * K_gamma - K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
+        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1) / alpha
+        term2 = (K_value * (act_dim * K_gamma - K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
         # term3 = (K_grad.permute(0,1,3,2).matmul(score_func.unsqueeze(1))).sum(-1).sum(-1)/(num_particles-1)
         term1, term2 = term1.to(device), term2.to(device)
         # print(term1.size(),term2.size()) # [100,10],[100,10]
