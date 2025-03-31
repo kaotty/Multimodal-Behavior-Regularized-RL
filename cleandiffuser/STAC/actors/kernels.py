@@ -31,7 +31,7 @@ class RBF(torch.nn.Module):
         
         # Compute the pairwise distances of left and right particles.
         diff = input_1.unsqueeze(-2) - input_2.unsqueeze(-3)
-        dist_sq = diff.pow(2).sum(-1) # [16,16,16]
+        dist_sq = diff.pow(2).sum(-1) # [100,10,10]
         dist_sq = dist_sq.unsqueeze(-1)
         
         # print('Sigma : ', self.sigma)
@@ -63,6 +63,11 @@ class RBF(torch.nn.Module):
                 median_sq = median_sq.reshape(-1,1,1,1)
                 h = median_sq / (2 * np.log(num_particles + 1.))
                 sigma = torch.sqrt(h)
+            else: 
+                dist_sum = dist_sq.detach().reshape(-1, num_particles*num_particles).sum(-1)
+                dist_sum = dist_sum.reshape(-1,1,1,1)
+                sigma = dist_sum / (4 * (2 * np.log(num_particles) + 1))
+                # print("sum:{}, sigma:{}".format(dist_sum.min(),sigma.min()))
         else:
             log_std = self.log_std_layer(dist_sq)
             log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
@@ -72,6 +77,7 @@ class RBF(torch.nn.Module):
 
         gamma = (1.0 / (1e-8 + 2 * sigma**2))
         kappa = (-gamma * dist_sq).exp() 
+        # print(diff.size(),gamma.size(),kappa.size()) # [16,16,16,6],[16,1,1,1],[16,16,16,1]
         kappa_grad = -2. * (diff * gamma) * kappa
         
         return kappa.squeeze(-1), dist_sq.squeeze(-1), gamma.squeeze(-1), kappa_grad
