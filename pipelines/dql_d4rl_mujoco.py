@@ -62,32 +62,45 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
           size: [batch_size, num_particles]
     """
     a = a_0 # [batch_size * num_particles, act_dim]
+    # print("a_0:{}".format(a_0.mean(0).mean(-1)))
     tr = torch.zeros(batch_size, num_particles).to(device) 
     for l in range(itr_num):
         q_1, q_2 = critic(s, a)
         q = torch.min(q_1, q_2)
         score_func = autograd.grad(q.sum(), a, retain_graph=True, create_graph=True)[0].to(device) # [batch_size * num_particles, act_dim]
         a, score_func = a.reshape(batch_size, num_particles, act_dim), score_func.reshape(batch_size, num_particles, act_dim)
+        # print("a_0:{}".format(a.mean(0).mean(-1)))
         # print(a.size(), score_func.size()) # [100,10,3],[100,10,3]
-        K_value, K_dist_sq, K_gamma, K_grad = kernel(a, a)
-        # print("gamma:{}, dist:{}".format(K_gamma.mean(), K_dist_sq.mean()))
+        # a_0_mean = a_0.mean(1)
+        # a_0_var = (a_0 - a_0_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
+        K_value, K_diff, K_dist_sq, K_gamma, K_grad = kernel(a, a)
+        # print("gamma:{}, dist:{}".format(K_gamma.max(), K_diff.mean()))
         # print(K_value.size(),K_dist_sq.size(),K_gamma.size(),K_grad.size()) # [100,10,10],[100,10,10],[100,1,1],[100,10,10,3]
-        h = (K_value.matmul(score_func) - alpha * K_grad.sum(2)) / num_particles
+        h = (K_value.matmul(score_func)/alpha - K_grad.sum(2)) / num_particles
         a, h = a.reshape(-1, act_dim), h.reshape(-1, act_dim) # [batch_size * num_particles, act_dim], [batch_size * num_particles, act_dim]
-
+        # print("Q_grad:{},k_grad:{}".format(K_value.matmul(score_func).mean(-1).mean(0)/num_particles, K_grad.sum(2).mean(-1).mean(0) / num_particles))
         # compute the sum of traces
-        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1)
-        term2 = alpha * (K_value * (act_dim * K_gamma - K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
-        # term3 = (K_grad.permute(0,1,3,2).matmul(score_func.unsqueeze(1))).sum(-1).sum(-1)/(num_particles-1)
+        term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1) / alpha
+        term2 = 2 * K_gamma.squeeze(-1) * ((K_grad * K_diff).sum(-1) + K_value * act_dim).sum(-1) / (num_particles-1)
+        term3 = (K_grad.permute(0,1,3,2).matmul(score_func.unsqueeze(1))).sum(-1).sum(-1)/(num_particles-1) / alpha
+        term4 = (K_value * (2 * act_dim * K_gamma - 4 * K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
         term1, term2 = term1.to(device), term2.to(device)
-        # print(term2)
+        # print("score:{}".format(score_func.mean(0).mean(-1)))
+        # print("distance:{}".format((act_dim * K_gamma - K_dist_sq * K_gamma * K_gamma).max()))
+        # print(term1.mean(), term2.mean(), term3.mean(), term4.mean())
         # print(term1.size(),term2.size()) # [100,10],[100,10]
         tr = tr + svgd_step * (term1 + term2)
         tr = tr.reshape(batch_size * num_particles, 1)
         a = a + svgd_step * h
+        a_svgd = a.reshape(batch_size, num_particles, act_dim)
+        a_svgd_mean = a_svgd.mean(1)
+        a_svgd_var = (a_svgd - a_svgd_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
+        a_0 = a_0.reshape(batch_size, num_particles, act_dim)
+        a_0_mean = a_0.mean(1)
+        a_0_var = (a_0 - a_0_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
 
     score = score_func.sum(-1)
-    return a, tr, score
+    return a, tr, score, a_0_var, a_svgd_var
 
 
 @hydra.main(config_path="../configs/dql/mujoco", config_name="mujoco", version_base=None)
@@ -173,7 +186,7 @@ def pipeline(args):
     svgd_gradient_step = 0
     actor.load(save_path + f'diffusion_ckpt_{args.task}_{args.gradient_steps}.pt')
     actor.eval()
-    log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "MMD": 0., "score_max": 0., "score_min":0., "score_mean":0.}
+    log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "MMD": 0., "score_max": 0., "score_min":0., "score_mean":0., "a_0_var": 0., "a_svgd_var": 0.}
     logger.info("Using SVGD to optimize the actions.")
     
     for batch in loop_dataloader(dataloader): 
@@ -183,7 +196,7 @@ def pipeline(args):
         rew = batch["rew"].to(args.device)
         tml = batch["tml"].to(args.device)
         prior = torch.zeros((args.batch_size * args.training_num_particles, act_dim), device=args.device)
-        kernel = RBF(num_particles=args.training_num_particles, sigma=None, adaptive_sig=0, device=args.device)
+        kernel = RBF(num_particles=args.training_num_particles, sigma=5, adaptive_sig=0, device=args.device)
 
         # generate behavioral actions
         next_obs = next_obs.unsqueeze(1).repeat(1, args.training_num_particles, 1).view(-1, obs_dim)
@@ -194,7 +207,7 @@ def pipeline(args):
         
         # Critic Training
         current_q1, current_q2 = critic(obs, act)
-        next_act, tr, score = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.batch_size, args.training_num_particles, act_dim, args.alpha, critic, kernel, args.device)
+        next_act, tr, score, a_0_var, a_svgd_var = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.batch_size, args.training_num_particles, act_dim, args.alpha, critic, kernel, args.device)
         # mmd = mmd_linear(a_0, next_act)
         
         target_q_1, target_q_2 = critic_target(next_obs, next_act)
@@ -224,6 +237,8 @@ def pipeline(args):
         log["score_max"] += score.max().item()
         log["score_min"] += score.min().item()
         log["score_mean"] += score.mean().item()
+        log["a_0_var"] += a_0_var.mean().item()
+        log["a_svgd_var"] += a_svgd_var.mean().item()
 
         if (svgd_gradient_step + 1) % args.log_interval == 0:
             log["gradient_steps"] = svgd_gradient_step + 1
@@ -234,9 +249,12 @@ def pipeline(args):
             log["score_max"] /= args.log_interval
             log["score_min"] /= args.log_interval
             log["score_mean"] /= args.log_interval
+            log["a_0_var"] /= args.log_interval
+            log["a_svgd_var"] /= args.log_interval
             logger.info("Training gradient step:{}, Critic loss:{}, Target q mean:{}, Trace:{}".format(log["gradient_steps"],log["critic_loss"],log["target_q_mean"],log["trace"]))
             logger.info("Score: max: {}, min:{}, mean:{}".format(log["score_max"],log["score_min"],log["score_mean"]))
-            log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "MMD": 0., "score_max": 0., "score_min":0., "score_mean":0.}
+            logger.info("a_0_var: {}, a_svgd_var: {}".format(log["a_0_var"], log["a_svgd_var"]))
+            log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "MMD": 0., "score_max": 0., "score_min":0., "score_mean":0., "a_0_var": 0., "a_svgd_var": 0.}
 
         # ----------- Inference ------------
         if (svgd_gradient_step + 1) % args.inference_interval == 0:
@@ -262,8 +280,8 @@ def pipeline(args):
                         n_samples=args.num_envs * args.num_candidates, sample_steps=args.sampling_steps, use_ema=False,
                         temperature=args.temperature, condition_cfg=obs, w_cfg=1.0, requires_grad=True)[0]
 
-                    kernel = RBF(num_particles=args.num_candidates, sigma=None, adaptive_sig=0, device=args.device)
-                    new_act, tr, score = svgd_update(act, obs, args.itr_num, args.svgd_step, args.num_envs, args.num_candidates, act_dim, args.alpha, critic, kernel, args.device)
+                    kernel = RBF(num_particles=args.num_candidates, sigma=1, adaptive_sig=0, device=args.device)
+                    new_act, tr, score, a_0_var, a_svgd_var = svgd_update(act, obs, args.itr_num, args.svgd_step, args.num_envs, args.num_candidates, act_dim, args.alpha, critic, kernel, args.device)
 
                     # resample
                     with torch.no_grad():
