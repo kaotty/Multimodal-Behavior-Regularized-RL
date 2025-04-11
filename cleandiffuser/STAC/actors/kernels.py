@@ -28,6 +28,8 @@ class RBF(torch.nn.Module):
         _, out_dim2 = input_2.size()[-2:]
         num_particles = input_2.size()[-2]
         assert out_dim1 == out_dim2
+
+        # print(input_1[0])
         
         # Compute the pairwise distances of left and right particles.
         diff = input_1.unsqueeze(-2) - input_2.unsqueeze(-3)
@@ -63,16 +65,24 @@ class RBF(torch.nn.Module):
                 median_sq = median_sq.reshape(-1,1,1,1)
                 h = median_sq / (2 * np.log(num_particles + 1.))
                 sigma = torch.sqrt(h)
-            else: 
+            elif self.adaptive_sig == 5: 
                 dist_sum = dist_sq.detach().reshape(-1, num_particles*num_particles).sum(-1)
                 dist_sum = dist_sum.reshape(-1,1,1,1)
                 sigma = dist_sum / (4 * (2 * np.log(num_particles) + 1))
+                # sigma = torch.sqrt(sigma)
                 # print("sum:{}, sigma:{}".format(dist_sum.min(),sigma.min()))
+            else:
+                a_mean = input_1.mean(1)
+                # print(a_mean.size(), input_1.size())
+                sigma = (input_1 - a_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
+                print("sigma:{}".format(sigma))
+                sigma = sigma.reshape(-1,1,1,1)
+                sigma = torch.sqrt(sigma)
         else:
             log_std = self.log_std_layer(dist_sq)
             log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
             sigma = torch.exp(log_std)
-        self.sigma_debug = torch.mean(sigma).detach().cpu().item()
+        # self.sigma_debug = torch.mean(sigma).detach().cpu().item()
         # print('***** sigma ', sigma[0])
 
         gamma = (1.0 / (1e-8 + 2 * sigma**2))
@@ -80,4 +90,4 @@ class RBF(torch.nn.Module):
         # print(diff.size(),gamma.size(),kappa.size()) # [16,16,16,6],[16,1,1,1],[16,16,16,1]
         kappa_grad = -2. * (diff * gamma) * kappa
         
-        return kappa.squeeze(-1), dist_sq.squeeze(-1), gamma.squeeze(-1), kappa_grad
+        return kappa.squeeze(-1), diff, dist_sq.squeeze(-1), gamma.squeeze(-1), kappa_grad
