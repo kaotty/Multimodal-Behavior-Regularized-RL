@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torch.autograd as autograd
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-
+import wandb
 from cleandiffuser.dataset.d4rl_mujoco_dataset import D4RLMuJoCoTDDataset
 from cleandiffuser.dataset.dataset_utils import loop_dataloader
 from cleandiffuser.diffusion import DiscreteDiffusionSDE
@@ -62,7 +62,6 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
           size: [batch_size, num_particles]
     """
     a = a_0 # [batch_size * num_particles, act_dim]
-    # print("a_0:{}".format(a_0.mean(0).mean(-1)))
     tr = torch.zeros(batch_size, num_particles).to(device) 
     for l in range(itr_num):
         q_1, q_2 = critic(s, a)
@@ -71,36 +70,36 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
         a, score_func = a.reshape(batch_size, num_particles, act_dim), score_func.reshape(batch_size, num_particles, act_dim)
         # print("a_0:{}".format(a.mean(0).mean(-1)))
         # print(a.size(), score_func.size()) # [100,10,3],[100,10,3]
-        # a_0_mean = a_0.mean(1)
-        # a_0_var = (a_0 - a_0_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
         K_value, K_diff, K_dist_sq, K_gamma, K_grad = kernel(a, a)
         # print("gamma:{}, dist:{}".format(K_gamma.max(), K_diff.mean()))
         # print(K_value.size(),K_dist_sq.size(),K_gamma.size(),K_grad.size()) # [100,10,10],[100,10,10],[100,1,1],[100,10,10,3]
         h = (K_value.matmul(score_func)/alpha - K_grad.sum(2)) / num_particles
         a, h = a.reshape(-1, act_dim), h.reshape(-1, act_dim) # [batch_size * num_particles, act_dim], [batch_size * num_particles, act_dim]
-        # print("Q_grad:{},k_grad:{}".format(K_value.matmul(score_func).mean(-1).mean(0)/num_particles, K_grad.sum(2).mean(-1).mean(0) / num_particles))
+        q_grad = score_func.abs().sum(-1).mean(-1)
+        k_grad = K_grad.sum(2).abs().sum(-1).mean(-1)
         # compute the sum of traces
         term1 = (K_grad * score_func.unsqueeze(1)).sum(-1).sum(-1) / (num_particles-1) / alpha
         term2 = 2 * K_gamma.squeeze(-1) * ((K_grad * K_diff).sum(-1) + K_value * act_dim).sum(-1) / (num_particles-1)
         term3 = (K_grad.permute(0,1,3,2).matmul(score_func.unsqueeze(1))).sum(-1).sum(-1)/(num_particles-1) / alpha
         term4 = (K_value * (2 * act_dim * K_gamma - 4 * K_dist_sq * K_gamma.pow(2))).sum(-1) / (num_particles-1)
         term1, term2 = term1.to(device), term2.to(device)
-        # print("score:{}".format(score_func.mean(0).mean(-1)))
-        # print("distance:{}".format((act_dim * K_gamma - K_dist_sq * K_gamma * K_gamma).max()))
         # print(term1.mean(), term2.mean(), term3.mean(), term4.mean())
         # print(term1.size(),term2.size()) # [100,10],[100,10]
         tr = tr + svgd_step * (term1 + term2)
         tr = tr.reshape(batch_size * num_particles, 1)
         a = a + svgd_step * h
+        # print("a:{},h:{}".format(a.reshape(-1,num_particles,act_dim).mean(-1).mean(0), h.reshape(-1,num_particles,act_dim).abs().mean(-1).mean(0)))
         a_svgd = a.reshape(batch_size, num_particles, act_dim)
         a_svgd_mean = a_svgd.mean(1)
         a_svgd_var = (a_svgd - a_svgd_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
+        a_svgd_cv = a_svgd_var.sqrt() / a_svgd_mean.sum(-1)
         a_0 = a_0.reshape(batch_size, num_particles, act_dim)
         a_0_mean = a_0.mean(1)
         a_0_var = (a_0 - a_0_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
+        a_0_cv = a_0_var.sqrt() / a_0_mean.sum(-1)
 
     score = score_func.sum(-1)
-    return a, tr, score, a_0_var, a_svgd_var
+    return a, tr, score, a_0_cv, a_svgd_cv, q_grad, k_grad
 
 
 @hydra.main(config_path="../configs/dql/mujoco", config_name="mujoco", version_base=None)
@@ -123,16 +122,20 @@ def pipeline(args):
     nn_diffusion = DQLMlp(obs_dim, act_dim, emb_dim=64, timestep_emb_type="positional").to(args.device)
     nn_condition = IdentityCondition(dropout=0.0).to(args.device)
 
-    logger = logging.getLogger('my_logger')
-    logger.setLevel(logging.INFO)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    os.makedirs(os.path.join(script_dir,'logs'), exist_ok=True)
-    log_path = os.path.join(script_dir, 'logs', 'latest-{}-itr{}-alpha{}'.format(args.task.env_name,args.itr_num,args.alpha))
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    wandb.init(project="dql_mujoco", 
+               config=dict(args),
+               name=f"{args.task.env_name}-itr_num:{args.itr_num}-alpha:{args.alpha}")
+
+    # logger = logging.getLogger('my_logger')
+    # logger.setLevel(logging.INFO)
+    # script_dir = os.path.dirname(os.path.abspath(__file__))
+    # os.makedirs(os.path.join(script_dir,'logs'), exist_ok=True)
+    # log_path = os.path.join(script_dir, 'logs', 'latest-{}-itr{}-alpha{}'.format(args.task.env_name,args.itr_num,args.alpha))
+    # file_handler = logging.FileHandler(log_path)
+    # file_handler.setLevel(logging.INFO)
+    # formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # file_handler.setFormatter(formatter)
+    # logger.addHandler(file_handler)
 
     print(f"======================= Parameter Report of Diffusion Model =======================")
     report_parameters(nn_diffusion)
@@ -155,10 +158,10 @@ def pipeline(args):
     actor.train()
     critic.train()
     pretrain_gradient_step = 0
-    log = {"critic_loss": 0., "actor_loss":0., "target_q_mean": 0., "trace": 0., "MMD": 0.}
+    log = {"critic_loss": 0., "actor_loss":0., "target_q_mean": 0., "trace": 0.}
     
     if args.mode == 'pretrain': 
-        logger.info("Starting to pretrain the diffusion model.")
+        # logger.info("Starting to pretrain the diffusion model.")
         for batch in loop_dataloader(dataloader):
 
             obs, next_obs = batch["obs"]["state"].to(args.device), batch["next_obs"]["state"].to(args.device)
@@ -175,7 +178,7 @@ def pipeline(args):
             log["actor_loss"] += actor_loss.item()
 
             if pretrain_gradient_step % args.log_interval == 0:
-                logger.info("Actor training gradient step:{}, Actor loss:{}".format(pretrain_gradient_step, log["actor_loss"]/args.log_interval))
+                # logger.info("Actor training gradient step:{}, Actor loss:{}".format(pretrain_gradient_step, log["actor_loss"]/args.log_interval))
                 log["actor_loss"] = 0
 
             if pretrain_gradient_step >= args.gradient_steps:
@@ -186,8 +189,8 @@ def pipeline(args):
     svgd_gradient_step = 0
     actor.load(save_path + f'diffusion_ckpt_{args.task}_{args.gradient_steps}.pt')
     actor.eval()
-    log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "MMD": 0., "score_max": 0., "score_min":0., "score_mean":0., "a_0_var": 0., "a_svgd_var": 0.}
-    logger.info("Using SVGD to optimize the actions.")
+    log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "score_max": 0., "score_min":0., "score_mean":0., "a_0_cv": 0., "a_svgd_cv": 0., "q_grad": 0., "k_grad": 0.}
+    # logger.info("Using SVGD to optimize the actions.")
     
     for batch in loop_dataloader(dataloader): 
 
@@ -207,7 +210,7 @@ def pipeline(args):
         
         # Critic Training
         current_q1, current_q2 = critic(obs, act)
-        next_act, tr, score, a_0_var, a_svgd_var = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.batch_size, args.training_num_particles, act_dim, args.alpha, critic, kernel, args.device)
+        next_act, tr, score, a_0_cv, a_svgd_cv, q_grad, k_grad = svgd_update(a_0, next_obs, args.itr_num, args.svgd_step, args.batch_size, args.training_num_particles, act_dim, args.alpha, critic, kernel, args.device)
         # mmd = mmd_linear(a_0, next_act)
         
         target_q_1, target_q_2 = critic_target(next_obs, next_act)
@@ -233,28 +236,42 @@ def pipeline(args):
         log["critic_loss"] += critic_loss.item()
         log["target_q_mean"] += target_q.mean().item()
         log["trace"] += tr.mean().item()
-        # log["MMD"] += mmd
         log["score_max"] += score.max().item()
         log["score_min"] += score.min().item()
         log["score_mean"] += score.mean().item()
-        log["a_0_var"] += a_0_var.mean().item()
-        log["a_svgd_var"] += a_svgd_var.mean().item()
+        log["a_0_cv"] += a_0_cv.mean().item()
+        log["a_svgd_cv"] += a_svgd_cv.mean().item()
+        log["q_grad"] += q_grad.mean().item()
+        log["k_grad"] += k_grad.mean().item()
 
         if (svgd_gradient_step + 1) % args.log_interval == 0:
             log["gradient_steps"] = svgd_gradient_step + 1
             log["critic_loss"] /= args.log_interval
             log["target_q_mean"] /= args.log_interval
             log["trace"] /= args.log_interval
-            # log["MMD"] /= args.log_interval
             log["score_max"] /= args.log_interval
             log["score_min"] /= args.log_interval
             log["score_mean"] /= args.log_interval
-            log["a_0_var"] /= args.log_interval
-            log["a_svgd_var"] /= args.log_interval
-            logger.info("Training gradient step:{}, Critic loss:{}, Target q mean:{}, Trace:{}".format(log["gradient_steps"],log["critic_loss"],log["target_q_mean"],log["trace"]))
-            logger.info("Score: max: {}, min:{}, mean:{}".format(log["score_max"],log["score_min"],log["score_mean"]))
-            logger.info("a_0_var: {}, a_svgd_var: {}".format(log["a_0_var"], log["a_svgd_var"]))
-            log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "MMD": 0., "score_max": 0., "score_min":0., "score_mean":0., "a_0_var": 0., "a_svgd_var": 0.}
+            log["a_0_cv"] /= args.log_interval
+            log["a_svgd_cv"] /= args.log_interval
+            log["q_grad"] /= args.log_interval
+            log["k_grad"] /= args.log_interval
+            wandb.log({
+                "train/critic_loss": log["critic_loss"],
+                "train/target_q_mean": log["target_q_mean"],
+                "train/trace": log["trace"],
+                "train/score_max": log["score_max"],
+                "train/score_min": log["score_min"],
+                "train/score_mean": log["score_mean"],
+                "train/a_0_cv": log["a_0_cv"],
+                "train/a_svgd_cv": log["a_svgd_cv"],
+                "train/q_grad": log["q_grad"],
+                "train/k_grad": log["k_grad"],
+            }, step=svgd_gradient_step)
+            # logger.info("Training gradient step:{}, Critic loss:{}, Target q mean:{}, Trace:{}".format(log["gradient_steps"],log["critic_loss"],log["target_q_mean"],log["trace"]))
+            # logger.info("Score: max: {}, min:{}, mean:{}".format(log["score_max"],log["score_min"],log["score_mean"]))
+            # logger.info("a_0_var: {}, a_svgd_var: {}".format(log["a_0_var"], log["a_svgd_var"]))
+            log = {"critic_loss": 0., "target_q_mean": 0., "trace": 0., "score_max": 0., "score_min":0., "score_mean":0., "a_0_cv": 0., "a_svgd_cv": 0., "q_grad": 0., "k_grad": 0.}
 
         # ----------- Inference ------------
         if (svgd_gradient_step + 1) % args.inference_interval == 0:
@@ -281,7 +298,7 @@ def pipeline(args):
                         temperature=args.temperature, condition_cfg=obs, w_cfg=1.0, requires_grad=True)[0]
 
                     kernel = RBF(num_particles=args.num_candidates, sigma=1, adaptive_sig=0, device=args.device)
-                    new_act, tr, score, a_0_var, a_svgd_var = svgd_update(act, obs, args.itr_num, args.svgd_step, args.num_envs, args.num_candidates, act_dim, args.alpha, critic, kernel, args.device)
+                    new_act, tr, score, a_0_cv, a_svgd_cv, q_grad, k_grad = svgd_update(act, obs, args.itr_num, args.svgd_step, args.num_envs, args.num_candidates, act_dim, args.alpha, critic, kernel, args.device)
 
                     # resample
                     with torch.no_grad():
@@ -307,7 +324,11 @@ def pipeline(args):
 
             episode_rewards = [list(map(lambda x: env.get_normalized_score(x), r)) for r in episode_rewards]
             episode_rewards = np.array(episode_rewards)
-            logger.info("Inference gradient step:{}, mean:{}, std:{}".format(svgd_gradient_step + 1, np.mean(episode_rewards, -1), np.std(episode_rewards, -1)))
+            wandb.log({
+                "eval/reward_mean": np.mean(episode_rewards, -1),
+                "eval/reward_std": np.std(episode_rewards, -1)
+            }, step=svgd_gradient_step)
+            # logger.info("Inference gradient step:{}, mean:{}, std:{}".format(svgd_gradient_step + 1, np.mean(episode_rewards, -1), np.std(episode_rewards, -1)))
 
             critic.train()
 
