@@ -92,11 +92,11 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
         a_svgd = a.reshape(batch_size, num_particles, act_dim)
         a_svgd_mean = a_svgd.mean(1)
         a_svgd_var = (a_svgd - a_svgd_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
-        a_svgd_cv = a_svgd_var.sqrt() / a_svgd_mean.sum(-1)
+        a_svgd_cv = a_svgd_var.sqrt() / a_svgd.abs().mean(1).sum(-1)
         a_0 = a_0.reshape(batch_size, num_particles, act_dim)
         a_0_mean = a_0.mean(1)
         a_0_var = (a_0 - a_0_mean.unsqueeze(1)).pow(2).sum(-1).sum(-1) / (num_particles-1)
-        a_0_cv = a_0_var.sqrt() / a_0_mean.sum(-1)
+        a_0_cv = a_0_var.sqrt() / a_0.abs().mean(1).sum(-1)
 
     score = score_func.sum(-1)
     return a, tr, score, a_0_cv, a_svgd_cv, q_grad, k_grad
@@ -325,8 +325,8 @@ def pipeline(args):
             episode_rewards = [list(map(lambda x: env.get_normalized_score(x), r)) for r in episode_rewards]
             episode_rewards = np.array(episode_rewards)
             wandb.log({
-                "eval/reward_mean": np.mean(episode_rewards, -1),
-                "eval/reward_std": np.std(episode_rewards, -1)
+                "inference/reward_mean": np.mean(episode_rewards).item(),
+                "inference/reward_std": np.std(episode_rewards).item(),
             }, step=svgd_gradient_step)
             # logger.info("Inference gradient step:{}, mean:{}, std:{}".format(svgd_gradient_step + 1, np.mean(episode_rewards, -1), np.std(episode_rewards, -1)))
 
