@@ -86,7 +86,6 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
         # print(term1.mean(), term2.mean(), term3.mean(), term4.mean())
         # print(term1.size(),term2.size()) # [100,10],[100,10]
         tr = tr + svgd_step * (term1 + term2)
-        tr = tr.reshape(batch_size * num_particles, 1)
         a = a + svgd_step * h
         # print("a:{},h:{}".format(a.reshape(-1,num_particles,act_dim).mean(-1).mean(0), h.reshape(-1,num_particles,act_dim).abs().mean(-1).mean(0)))
         a_svgd = a.reshape(batch_size, num_particles, act_dim)
@@ -99,6 +98,7 @@ def svgd_update(a_0, s, itr_num, svgd_step, batch_size, num_particles, act_dim, 
         a_0_cv = a_0_var.sqrt() / a_0.abs().mean(1).sum(-1)
 
     score = score_func.sum(-1)
+    tr = tr.reshape(batch_size * num_particles, 1)
     return a, tr, score, a_0_cv, a_svgd_cv, q_grad, k_grad
 
 
@@ -124,7 +124,8 @@ def pipeline(args):
 
     wandb.init(project="dql_mujoco", 
                config=dict(args),
-               name=f"{args.task.env_name}-itr_num:{args.itr_num}-alpha:{args.alpha}")
+               settings=wandb.Settings(init_timeout=120),
+               name=f"withtrace-{args.task.env_name}-itr_num:{args.itr_num}-alpha:{args.alpha}-epsilon:{args.svgd_step}-seed:{args.seed}")
 
     # logger = logging.getLogger('my_logger')
     # logger.setLevel(logging.INFO)
